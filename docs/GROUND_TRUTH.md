@@ -250,15 +250,28 @@ on HTTP 429.
 
 ## 9. Measured statistics
 
-Measured on the realised KXBTCD settlement series (`expiration_value`):
+Measured on the realised KXBTCD settlement series (`expiration_value`), **1,596 hourly
+settlement-to-settlement returns spanning 2026-05-22 to 2026-07-29**:
 
 | Statistic | Value |
 |---|---|
-| Volatility | **0.393% per hour** = 36.8% annualised |
-| Excess kurtosis | **3.66** |
+| Volatility | **0.466% per hour** = 43.6% annualised |
+| Excess kurtosis | **12.88** |
+| Largest single-hour move in sample | ~1.6% |
 
-The excess kurtosis is why `pricing.price_above(..., dist="t")` exists. The Gaussian default
-is a benchmark, not a recommendation for live trading.
+Reproduce with `kbtc settlements` then querying the `settlements` table.
+
+Excess kurtosis of 12.88 is *very* fat-tailed, and is why `pricing.price_above(..., dist="t")`
+exists. The Gaussian default is a benchmark, not a recommendation for live trading.
+
+Two caveats worth stating rather than burying. First, this is ~2 months of one broad
+volatility regime; it is not a claim about all market conditions. Second, use this series
+rather than spot bars: vol measured settlement-to-settlement is the correct pricing basis,
+and it differed materially from the 0.28%/hr the same day's 1-minute Coinbase bars implied.
+
+*(An earlier revision of this file quoted 0.393%/hr and kurtosis 3.66. Those came from only
+43 settlements — the sample was too small, and kurtosis especially so. The figures above
+supersede them.)*
 
 ---
 
