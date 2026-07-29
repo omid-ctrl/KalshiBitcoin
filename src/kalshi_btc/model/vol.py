@@ -105,8 +105,11 @@ log = logging.getLogger(__name__)
 
 SECONDS_PER_MINUTE = 60.0
 
-# Measured on the realised KXBTCD settlement series: 0.393% per hour.
-DEFAULT_SIGMA_PER_MINUTE = 0.00393 / math.sqrt(60.0)
+# Measured on the realised KXBTCD settlement series (`expiration_value`): 0.466% per hour
+# = 43.6% annualised, over 1,596 hourly settlement-to-settlement returns spanning
+# 2026-05-22 to 2026-07-29. Caveat: ~2 months of a single broad volatility regime, so
+# treat it as a starting prior that the fitted model should override, not as a constant.
+DEFAULT_SIGMA_PER_MINUTE = 0.00466 / math.sqrt(60.0)
 
 # RiskMetrics daily decay. We run it on hourly observations, where a slower decay is
 # appropriate than the 0.94 used on daily bars, but 0.94 remains a sane default that
@@ -692,7 +695,7 @@ def as_utc(t: datetime) -> datetime:
 class VolClamp:
     """Hard band on the per-minute sigma the pricer is allowed to see.
 
-    Defaults are roughly 0.2x and 4x the measured 36.8% annualised level. A forecast
+    Defaults are roughly 0.2x and 4x the measured 43.6% annualised level. A forecast
     outside this band means the fit is broken or the tape is doing something the model
     was never calibrated for; in both cases the correct action is to clamp LOUDLY and let
     the operator see it, not to quote off it silently.

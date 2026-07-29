@@ -117,9 +117,20 @@ class KalshiClient:
         self.base = settings.rest_base.rstrip("/")
         self._session = session
         self._owns_session = session is None
+        # Load the signing key if we can, but NEVER let a missing or broken key file
+        # break the public-data path. Market data needs no credentials, and a
+        # half-configured account (key ID set, private key not yet saved) is a normal
+        # state to be in - it is exactly where you are between creating a key on the
+        # website and putting the .pem on disk. Raising here would take down `status`,
+        # `capture` and `proxy-score`, none of which authenticate anything.
         self._key: rsa.RSAPrivateKey | None = None
+        self._key_error: str | None = None
         if settings.has_credentials:
-            self._key = load_private_key(settings.private_key_path)
+            try:
+                self._key = load_private_key(settings.private_key_path)
+            except (FileNotFoundError, TypeError, ValueError) as exc:
+                self._key_error = str(exc)
+                log.warning("private key unavailable, running public-data only: %s", exc)
         self.read_bucket = TokenBucket(200.0, 200.0)
         self.write_bucket = TokenBucket(100.0, 100.0)
 
@@ -163,9 +174,11 @@ class KalshiClient:
         headers: dict[str, str] = {"Accept": "application/json"}
         if authed:
             if self._key is None:
+                detail = f" ({self._key_error})" if self._key_error else ""
                 raise PermissionError(
                     "This call needs Kalshi API credentials. Set KALSHI_API_KEY_ID and "
-                    "KALSHI_PRIVATE_KEY_PATH in .env. (Market data does not need them.)"
+                    "KALSHI_PRIVATE_KEY_PATH in .env, and make sure the private key file "
+                    f"actually exists.{detail} (Market data does not need credentials.)"
                 )
             ts = int(time.time() * 1000)
             path = self._path(endpoint)  # query string deliberately excluded

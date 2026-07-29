@@ -69,6 +69,7 @@ from kalshi_btc.core.fees import taker_fee
 from kalshi_btc.core.types import Action, Liquidity, MarketSnapshot, Side, _ts
 from kalshi_btc.exec.client import KalshiClient, event_is_hourly
 from kalshi_btc.feed.kalshi_ws import CH_BRTI, CH_ORDERBOOK, CH_TRADE, BrtiTick, KalshiWebSocket
+from kalshi_btc.feed.spot_ws import DEFAULT_VENUES, SpotFeed
 from kalshi_btc.model.vol import VolModel
 from kalshi_btc.risk.killswitch import KillSwitch
 from kalshi_btc.risk.limits import RiskManager
@@ -114,6 +115,11 @@ MIN_HOURLY_STRIKES = 50
 # An hourly event closes every hour, so the soonest-closing one is never further away than
 # that. Anything beyond means the discriminator picked the wrong instrument.
 MAX_CURRENT_EVENT_MINUTES = 75.0
+
+# How long a public spot-proxy print stays authoritative. The feed itself only publishes a
+# composite when >=2 venues are fresh within 5s and agree to 5bps, so anything older than
+# this is a feed that has gone quiet rather than a price - fall through to the ladder.
+PROXY_MAX_AGE_S = 10.0
 
 
 # ======================================================================================
@@ -392,6 +398,7 @@ class PaperCounters:
 
     cycles: int = 0
     ladder_rows: int = 0
+    spot_rows: int = 0
     decisions: int = 0
     quotes_placed: int = 0
     quotes_cancelled: int = 0
@@ -483,16 +490,53 @@ class SpotState:
         else:
             self.window = None
 
+    def update_from_proxy(self, value: float, ts: datetime) -> None:
+        """Adopt the public Coinbase/Kraken/Bitstamp composite.
+
+        Ranks BELOW a real BRTI tick and ABOVE a ladder inference, and both halves of that
+        ordering are deliberate.
+
+        Below BRTI because BRTI *is* the settlement index while this only tracks it - to
+        within single-digit dollars in our measurements, which is immaterial against a
+        $100 strike gap and decisive inside the settlement minute. Grade it for yourself
+        with `kbtc proxy-score` before trusting it near the close.
+
+        Above the ladder because the ladder inference is derived from the very quotes we
+        are trying to form an opinion about. Pricing off it is close to circular: it
+        recovers the market's own view and finds, unsurprisingly, no edge. An independently
+        observed price from other venues is what makes the opinion a differentiated one.
+
+        Without this path a no-credentials install has NO usable spot at all: BRTI never
+        arrives and the ladder estimate is dispersion-gated, so a live 45s session skipped
+        23 of 23 cycles for "no trustworthy spot" and never placed a single simulated
+        trade. That is the entire credential-free path failing silently.
+        """
+        if self.source == "brti" and self.ts is not None and (ts - self.ts).total_seconds() < 15:
+            return
+        self.value = float(value)
+        self.source = "spot-proxy"
+        self.ts = ts
+
     def update_from_ladder(self, estimate: SpotEstimate, ts: datetime) -> None:
         """Adopt a ladder-implied level, or drop to no-spot when it is not trustworthy.
 
-        Two rules. A real BRTI tick always wins, because letting a ladder inference
-        overwrite a licensed price would be a silent downgrade. And an UNUSABLE estimate
-        clears the value rather than leaving the previous one in place: a stale spot from
-        two seconds ago looks exactly like a good one to everything downstream, and that
-        is the failure this whole guard exists to prevent.
+        Three rules. A real BRTI tick always wins, because letting a ladder inference
+        overwrite a licensed price would be a silent downgrade. A FRESH public spot proxy
+        also wins, for the anti-circularity reason in `update_from_proxy`. And an UNUSABLE
+        estimate clears the value rather than leaving the previous one in place: a stale
+        spot from two seconds ago looks exactly like a good one to everything downstream,
+        and that is the failure this whole guard exists to prevent.
         """
         if self.source == "brti" and self.ts is not None and (ts - self.ts).total_seconds() < 15:
+            return
+        if (
+            self.source == "spot-proxy"
+            and self.ts is not None
+            and (ts - self.ts).total_seconds() < PROXY_MAX_AGE_S
+        ):
+            # Keep the observed price, but still record the estimate so the operator can
+            # see what the ladder thought and how far apart the two were.
+            self.estimate = estimate
             return
         self.estimate = estimate
         if estimate.usable and estimate.value is not None:
@@ -665,7 +709,29 @@ async def run_paper(
     counters = PaperCounters()
     owns_store = store is None
     store = store or Store(settings)
-    await store.start()
+    try:
+        await store.start()
+    except Exception as exc:  # noqa: BLE001 - translated to an operator sentence below
+        # DuckDB allows exactly ONE writer process, and paper is a writer: it records
+        # ladder snapshots, decisions and simulated fills. `kbtc capture` is also a
+        # writer and the README tells you to leave it running forever, so operators hit
+        # this collision on their first Phase 2 run. A raw IOException traceback does not
+        # tell anyone what to do about it, and the two readers (`report`, `calibrate`)
+        # already degrade gracefully, so this one should explain itself too.
+        if "lock" not in str(exc).lower():
+            raise
+        raise RuntimeError(
+            f"The capture database {store.path} is locked by another process — almost "
+            "certainly `kbtc capture`. DuckDB allows only one writer, and `kbtc paper` "
+            "is a writer too (it records ladder snapshots, decisions and simulated "
+            "fills).\n\n"
+            "Stop `kbtc capture` for the duration of the paper session. Paper records "
+            "the ladder itself, so you keep collecting ladder history while it runs — "
+            "you only lose the public spot-proxy rows, which paper does not write. "
+            "Restart capture when the session ends.\n\n"
+            "`kbtc report` and `kbtc calibrate` are readers and DO work while capture "
+            "holds the lock; only the writers collide."
+        ) from exc
 
     engine = engine or FairValueEngine()
     quoter = quoter or MakerQuoter(risk=settings.risk, refresh_seconds=ladder_interval_s)
@@ -675,6 +741,7 @@ async def run_paper(
     spot_state = SpotState()
 
     feed: KalshiWebSocket | None = None
+    spot_feed: SpotFeed | None = None
     deadline = None if duration_s is None else time.monotonic() + duration_s
 
     console.print(f"[bold]kbtc paper[/] | {settings.describe()}")
@@ -707,10 +774,23 @@ async def run_paper(
                 settings, tickers=[], channels=(CH_ORDERBOOK, CH_TRADE, CH_BRTI)
             )
             feed.start()
+
+            # The public spot proxy runs ALWAYS, credentials or not. It is the only
+            # independent price a keyless install ever sees, and without it the ladder
+            # inference is the sole spot source - which the dispersion gate rejects often
+            # enough that a session can trade nothing at all.
+            spot_feed = SpotFeed(DEFAULT_VENUES)
+            spot_feed.start()
+            await spot_feed.wait_ready(timeout=8.0, venues=2)
+            console.print(f"[dim]spot proxy: {spot_feed.describe()}[/]")
+
             if not feed.available:
                 console.print(
-                    "[yellow]No credentials: no BRTI feed. Spot is inferred from the ladder, "
-                    "so the model trades RELATIVE VALUE (tail shape) only, not direction.[/]"
+                    "[yellow]No credentials: no BRTI feed.[/] Spot comes from the public "
+                    "venue composite above, falling back to the ladder when it goes stale. "
+                    "The proxy tracks BRTI to within a few dollars — fine against a $100 "
+                    "strike gap, [bold]not[/] fine inside the settlement minute. Grade it "
+                    "with [bold]kbtc proxy-score[/]."
                 )
 
             next_tick = time.monotonic()
@@ -726,6 +806,7 @@ async def run_paper(
                         client=client,
                         store=store,
                         feed=feed,
+                        spot_feed=spot_feed,
                         engine=engine,
                         quoter=quoter,
                         risk=risk,
@@ -773,6 +854,16 @@ async def run_paper(
     finally:
         if feed is not None:
             await feed.stop()
+        if spot_feed is not None:
+            # Drain what the venues sent after the last cycle so a short session does not
+            # throw away its final second of spot history.
+            for tick in spot_feed.drain():
+                store.add_spot(
+                    ts=tick.ts, venue=tick.venue, bid=tick.bid, ask=tick.ask,
+                    mid=tick.mid, proxy=tick.proxy,
+                )
+                counters.spot_rows += 1
+            await spot_feed.stop()
         counters.halts = len(killswitch.halts)
         await store.flush()
         with contextlib.suppress(Exception):
@@ -840,6 +931,7 @@ async def _cycle(
     client: KalshiClient,
     store: Store,
     feed: KalshiWebSocket | None,
+    spot_feed: SpotFeed | None,
     engine: FairValueEngine,
     quoter: MakerQuoter,
     risk: RiskManager,
@@ -880,6 +972,20 @@ async def _cycle(
                     windowed_avg=ev.windowed_avg,
                     tick_count=ev.tick_count,
                 )
+
+    # The public composite. Free, no credentials, and the only independent price a
+    # keyless install ever sees - `spot_feed.proxy()` already enforces the venue-count and
+    # cross-venue-agreement gates, returning None rather than a lone venue's opinion.
+    if spot_feed is not None:
+        for tick in spot_feed.drain():
+            store.add_spot(
+                ts=tick.ts, venue=tick.venue, bid=tick.bid, ask=tick.ask,
+                mid=tick.mid, proxy=tick.proxy,
+            )
+            counters.spot_rows += 1
+        px = spot_feed.proxy()
+        if px is not None:
+            spot_state.update_from_proxy(float(px), now)
 
     quotes = [LadderQuote.from_snapshot(m) for m in markets]
     sigma = vol_model.sigma_per_minute(now)

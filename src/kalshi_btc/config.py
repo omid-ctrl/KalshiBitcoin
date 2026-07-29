@@ -85,7 +85,16 @@ class Settings:
 
     @property
     def has_credentials(self) -> bool:
-        return bool(self.api_key_id and self.private_key_path)
+        """True only when we can ACTUALLY sign a request.
+
+        Deliberately checks that the key file exists rather than just that a path was
+        configured. A key ID with a path pointing at nothing is the normal state between
+        creating an API key on Kalshi's website and saving the .pem, and reporting that
+        as "has credentials" makes every downstream check lie about what will work.
+        """
+        if not (self.api_key_id and self.private_key_path):
+            return False
+        return Path(self.private_key_path).expanduser().exists()
 
     def describe(self) -> str:
         armed = "ARMED (REAL MONEY)" if self.armed else "disarmed (no orders will be sent)"

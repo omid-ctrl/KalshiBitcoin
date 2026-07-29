@@ -61,6 +61,10 @@ class CalibrationSummary:
     market_brier: float
     out_of_sample: bool
     output_path: Path
+    # "brti" (the real licensed tape) or "spot-proxy" (the free public composite). Carried
+    # all the way out to the operator because a skill score means different things
+    # depending on which spot the model was fed.
+    spot_source: str = "brti"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -71,6 +75,7 @@ class CalibrationSummary:
             "model_brier": self.model_brier,
             "market_brier": self.market_brier,
             "out_of_sample": self.out_of_sample,
+            "spot_source": self.spot_source,
             "written_to": str(self.output_path),
         }
 
@@ -118,7 +123,7 @@ def run_calibration(settings: Settings, days: int = 30) -> dict[str, Any]:
             )
 
         vol, cutoff, fitted = _fit_vol(close_times, settlements)
-        records = _load_records(con, days)
+        records, spot_source = _load_records(con, days)
     finally:
         try:
             con.close()
@@ -128,9 +133,15 @@ def run_calibration(settings: Settings, days: int = 30) -> dict[str, Any]:
     if not records:
         raise RuntimeError(
             f"No usable ladder snapshots in the last {days} days. Each observation needs a "
-            "quoted mid AND a BRTI value within "
-            f"{MAX_SPOT_STALENESS_SECONDS:.0f}s — check that the cfbenchmarks_value feed is "
-            "actually being recorded (`kbtc report` shows the BRTI tick count)."
+            f"quoted mid AND a spot value within {MAX_SPOT_STALENESS_SECONDS:.0f}s of it. "
+            "We look for the real BRTI tape first and fall back to the public spot proxy; "
+            "neither had a match. Check that `kbtc capture` is recording both a ladder and "
+            "a spot feed (`kbtc report` shows the row counts)."
+        )
+    if spot_source == "spot-proxy":
+        log.warning(
+            "calibrating against the PUBLIC SPOT PROXY, not the real BRTI tape "
+            "(no credentials). Grade the proxy with `kbtc proxy-score`."
         )
 
     # The protocol has no settlement parameter, so this closure cannot peek even by accident.
@@ -152,6 +163,7 @@ def run_calibration(settings: Settings, days: int = 30) -> dict[str, Any]:
     payload["vol_describe"] = vol.describe()
     payload["source_db"] = str(db)
     payload["days_requested"] = days
+    payload["spot_source"] = spot_source
 
     out_path = data_dir / CALIBRATION_FILENAME
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -166,6 +178,7 @@ def run_calibration(settings: Settings, days: int = 30) -> dict[str, Any]:
         market_brier=result.market.brier,
         out_of_sample=result.is_out_of_sample,
         output_path=out_path,
+        spot_source=spot_source,
     )
     log.info("%s", result.headline())
     return summary.as_dict()
@@ -228,33 +241,91 @@ def _fit_vol(
     return model, cutoff, True
 
 
-def _load_records(con: Any, days: int) -> list[Any]:
-    """Build LadderRecords by ASOF-joining captured ladders to the BRTI tape.
+# The real BRTI tape, when we have credentials to record it.
+_RECORDS_SQL_BRTI = """
+    SELECT
+        CAST(l.ts AS VARCHAR)                          AS ts,
+        l.event_ticker,
+        l.ticker,
+        l.strike,
+        COALESCE(b.windowed_avg, b.avg_60s, b.value)   AS spot,
+        (l.yes_bid + l.yes_ask) / 2                    AS mid,
+        l.minutes_to_close,
+        date_diff('second', b.ts, l.ts)                AS spot_age
+    FROM ladder_snapshots l
+    ASOF JOIN brti b ON l.ts >= b.ts
+    WHERE l.ts >= CAST(? AS TIMESTAMP)
+      AND l.yes_bid IS NOT NULL AND l.yes_ask IS NOT NULL
+      AND l.minutes_to_close > 0
+"""
+
+# The credential-free substitute. One composite row per timestamp: the feed writes a row
+# per venue plus the composite in `proxy`, so we collapse to distinct (ts, proxy) first,
+# otherwise every ladder row would ASOF-join to whichever venue happened to print last.
+_RECORDS_SQL_SPOT = """
+    WITH p AS (
+        SELECT ts, max(proxy) AS proxy
+        FROM spot
+        WHERE proxy IS NOT NULL
+        GROUP BY ts
+    )
+    SELECT
+        CAST(l.ts AS VARCHAR)                          AS ts,
+        l.event_ticker,
+        l.ticker,
+        l.strike,
+        p.proxy                                        AS spot,
+        (l.yes_bid + l.yes_ask) / 2                    AS mid,
+        l.minutes_to_close,
+        date_diff('second', p.ts, l.ts)                AS spot_age
+    FROM ladder_snapshots l
+    ASOF JOIN p ON l.ts >= p.ts
+    WHERE l.ts >= CAST(? AS TIMESTAMP)
+      AND l.yes_bid IS NOT NULL AND l.yes_ask IS NOT NULL
+      AND l.minutes_to_close > 0
+"""
+
+
+def _load_records(con: Any, days: int) -> tuple[list[Any], str]:
+    """Build LadderRecords by ASOF-joining captured ladders to a spot tape.
+
+    Returns (records, source) where source is "brti" or "spot-proxy".
 
     `minutes_to_close` is recorded on every snapshot, so the close time is reconstructed
-    exactly rather than guessed from the ticker. Snapshots with no fresh BRTI value are
+    exactly rather than guessed from the ticker. Snapshots with no fresh spot value are
     dropped: a model priced off a stale spot is not the model we intend to score.
+
+    WHY THERE IS A FALLBACK: real-time BRTI is licensed, and Kalshi only serves it on the
+    authenticated `cfbenchmarks_value` channel, so a no-credentials install records ZERO
+    brti rows and this join returned nothing at all - calibration was unreachable for
+    exactly the users the capture path was designed to serve. `kbtc capture` does record a
+    free composite of public Coinbase/Kraken/Bitstamp books, so we fall back to it.
+
+    That substitution is NOT free, and the caller reports which source was used. The proxy
+    tracks BRTI to within single-digit dollars (grade it yourself with `kbtc proxy-score`),
+    which is immaterial when a strike is $100 away and decisive in the final minute where
+    the settlement average is the entire trade. Calibration scores mostly the former, so
+    the fallback is honest for this purpose - but a skill score computed off the proxy is
+    evidence about the MODEL, not proof that the endgame trade is reachable.
     """
     from kalshi_btc.model.calibration import LadderRecord
 
     since = datetime.now(UTC) - timedelta(days=max(1, days))
-    sql = """
-        SELECT
-            CAST(l.ts AS VARCHAR)                          AS ts,
-            l.event_ticker,
-            l.ticker,
-            l.strike,
-            COALESCE(b.windowed_avg, b.avg_60s, b.value)   AS spot,
-            (l.yes_bid + l.yes_ask) / 2                    AS mid,
-            l.minutes_to_close,
-            date_diff('second', b.ts, l.ts)                AS spot_age
-        FROM ladder_snapshots l
-        ASOF JOIN brti b ON l.ts >= b.ts
-        WHERE l.ts >= CAST(? AS TIMESTAMP)
-          AND l.yes_bid IS NOT NULL AND l.yes_ask IS NOT NULL
-          AND l.minutes_to_close > 0
-    """
-    rows = _rows(con, sql, [since.replace(tzinfo=None).isoformat(sep=" ")])
+    param = [since.replace(tzinfo=None).isoformat(sep=" ")]
+
+    source = "brti"
+    try:
+        rows = _rows(con, _RECORDS_SQL_BRTI, param)
+    except Exception as exc:  # noqa: BLE001 - a missing/legacy table is not fatal
+        log.info("brti join unavailable (%s); trying the spot proxy", exc)
+        rows = []
+    if not rows:
+        source = "spot-proxy"
+        try:
+            rows = _rows(con, _RECORDS_SQL_SPOT, param)
+        except Exception as exc:  # noqa: BLE001
+            log.info("spot proxy join unavailable (%s)", exc)
+            rows = []
 
     out: list[Any] = []
     for ts_raw, event, ticker, strike, spot, mid, mtc, spot_age in rows:
@@ -288,7 +359,7 @@ def _load_records(con: Any, days: int) -> list[Any]:
                 close_time=when + timedelta(minutes=mtc_f),
             )
         )
-    return out
+    return out, source
 
 
 def _parse_ts(raw: Any) -> datetime | None:

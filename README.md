@@ -203,7 +203,39 @@ kbtc settlements    # once a day
 non-trivial number of book snapshots and settled events with `expiration_value`. There is no
 shortcut. If your capture has gaps, fix the supervision before continuing.
 
-### Phase 1 — Calibrate (no money, no orders)
+### Phase 1a — Score the spot proxy (no money, no orders)
+
+```bash
+kbtc proxy-score
+```
+
+Run this **before** `kbtc calibrate`, because it can kill the whole strategy on its own.
+
+Settlement is the mean of 60 one-second CF Benchmarks BRTI ticks in the final minute.
+Real-time BRTI is a licensed product and Kalshi only proxies it to accounts with
+credentials, so `kbtc capture` builds a free substitute from public Coinbase / Kraken /
+Bitstamp order books. This command asks the only question that matters about that
+substitute: **does it actually track the index we settle against?** Every settled event
+publishes `expiration_value` — the realised 60-second BRTI average — so we compute our
+own average over the identical 60 seconds and measure the error. Free, public, no key.
+
+It needs capture to have been running across at least one hourly close, plus
+`kbtc settlements`. With no overlapping event it prints `NO DATA` and exits 0, because
+unknown is not the same as failure.
+
+**Gate:** median absolute error must be **< $5**, i.e. under 5% of the $100 strike
+spacing. Strikes are $100 apart, so an error comparable to the spacing means we cannot
+tell which side of a strike the index will land on during the one minute when that is the
+entire trade. `--threshold` moves the bar; the command exits 1 on FAIL so it can gate a
+pipeline.
+
+If this FAILs, the settlement-window edge is not reachable from public data, and the
+honest options are: pay for a real BRTI feed (Kalshi serves it on the `cfbenchmarks_value`
+channel with credentials), apply a constant bias correction if the bias term dominates the
+spread and re-score, or drop the settlement-window trade and keep only strategies that do
+not need the index in real time. Do not proceed to Phase 2 on a failed proxy.
+
+### Phase 1b — Calibrate (no money, no orders)
 
 ```bash
 kbtc calibrate
@@ -219,8 +251,24 @@ built on it.
 ### Phase 2 — Paper (live markets, simulated fills)
 
 ```bash
-kbtc paper
+kbtc paper                  # runs until you stop it
+kbtc paper --duration 45    # 45-second smoke test
+kbtc paper --hours 3        # stop after 3 hourly events
 ```
+
+No credentials, no orders, ever — there is no executable order path in this runner at all.
+It reads the live ladder, prices it, sizes with Kelly, and simulates fills against the real
+queue. `--duration` and `--hours` exist so you can prove the loop works end to end without
+committing to a week-long session.
+
+**Where its spot comes from** matters, and the runner prints which source it used every
+cycle. It prefers, in order: the licensed **BRTI** feed (credentials only — this is the
+actual settlement index); the free **public spot proxy** (Coinbase/Kraken/Bitstamp, the
+same composite `kbtc capture` records); and finally spot implied by the **ladder** itself.
+The ladder is last because pricing off it is close to circular — it recovers the market's
+own view and finds no edge — and because its dispersion gate rejects it often enough that
+it alone is not a reliable source. Run `kbtc proxy-score` to find out how much to trust
+the middle rung.
 
 **Gate:** at least a week, and the paper P&L in the report must be positive **after** the
 modelled fees and after realistic queue assumptions. This is where most theoretical edges
@@ -360,6 +408,7 @@ small is a smaller number in the report, and the cost of trading too big is not.
 | `kbtc status` | no | Current event, time to close, live strike ladder |
 | `kbtc capture` | **no** | Phase 0 recorder. Runs forever. Start this first |
 | `kbtc settlements` | no | Backfill settled markets and their `expiration_value` |
+| `kbtc proxy-score` | **no** | **Phase 1 gate.** Grade the public spot proxy against realised BRTI settlements. Exits 1 on FAIL |
 | `kbtc calibrate` | no | Score the model against the market mid on captured data |
 | `kbtc report` | no | Build the static HTML report and print its path |
 | `kbtc paper` | no | Paper trade against live markets. Never sends orders |
@@ -399,6 +448,16 @@ PYTHONPATH=src python -m kalshi_btc.cli doctor
 That is expected and harmless. DuckDB allows one writer process, so while `kbtc capture`
 is running the report copies the database and reads the copy. The note on the page tells
 you it did. Nothing is lost — the report is a point-in-time view either way.
+
+**`kbtc paper` says the capture database is locked.**
+DuckDB allows exactly one *writer* process, and both `kbtc capture` and `kbtc paper` are
+writers — paper records ladder snapshots, decisions and simulated fills. So the two cannot
+run at the same time. Stop `kbtc capture` for the duration of the paper session; paper
+records the ladder itself, so you keep collecting ladder history while it runs and only
+lose the public spot-proxy rows (which paper does not write). Restart capture afterwards.
+
+`kbtc report`, `kbtc calibrate` and `kbtc proxy-score` are *readers* and work fine while
+capture holds the lock. Only the writers collide.
 
 **`kbtc doctor` says my clock is off.**
 Turn on NTP and leave it on. Settlement is a mean of sixty one-second ticks and the last of

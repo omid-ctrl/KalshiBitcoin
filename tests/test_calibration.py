@@ -40,7 +40,7 @@ from kalshi_btc.model.calibration import (
 from kalshi_btc.model.pricing import TICKS, annual_to_per_minute, price_above
 
 SEED = 20260728
-SIGMA_MIN = annual_to_per_minute(0.368)
+SIGMA_MIN = annual_to_per_minute(0.436)
 SPOT = 63_800.0
 T0 = datetime(2026, 6, 1, tzinfo=UTC)
 
@@ -609,9 +609,25 @@ def test_the_edge_concentrates_in_the_final_minutes():
 
 
 def test_our_model_is_well_calibrated_where_the_market_maker_is_not():
-    """Reliability, not just aggregate score: our curve should hug the diagonal."""
+    """Reliability, not just aggregate score: our curve should hug the diagonal.
+
+    1200 events, not 400, and the reason is worth recording. `simulate_events` draws the
+    truth with SIGMA_MIN and we price with the same SIGMA_MIN, so the model here is
+    EXACTLY correctly specified and every deviation from the diagonal is sampling noise.
+    At 400 events that noise routinely breaches the 0.05 bar below: measured across 8
+    seeds the worst max-deviation was 0.056, and the bar held for the committed seed
+    purely by luck (2 of 8 seeds failed). The bar was never measuring model quality.
+
+    The noise is bigger than a naive binomial estimate suggests because the 30
+    observations of one event (5 strikes x 6 sample times) all resolve against a single
+    settlement, so bin counts of ~600 carry far fewer than 600 independent draws.
+
+    Tripling the event count shrinks the noise by ~sqrt(3) and takes the worst
+    max-deviation across those same 8 seeds to 0.036 - comfortably inside 0.05, so the
+    assertion now fails when the model is wrong rather than when the seed is unkind.
+    """
     rng = np.random.default_rng(SEED)
-    records, settlements = simulate_events(400, rng)
+    records, settlements = simulate_events(1200, rng)
 
     def asian(*, ts, spot, strike, minutes_to_close):
         return price_above(spot, strike, SIGMA_MIN, minutes_to_close).prob_above

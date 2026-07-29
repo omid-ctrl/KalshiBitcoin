@@ -44,8 +44,11 @@ taken as zero: over one hour, any plausible drift is orders of magnitude smaller
 sigma * sqrt(tau).
 
 Fat tails are supported via a Student-t innovation (see `dist="t"`). Measured excess
-kurtosis on the realised KXBTCD settlement series was 3.66, so the Gaussian default is
-a benchmark, not a recommendation for live trading.
+kurtosis on the realised KXBTCD settlement series is 12.88 - measured over 1,596 hourly
+settlements spanning 2026-05-22 to 2026-07-29, a much larger sample than the 43
+settlements an earlier revision quoted 3.66 from. A Gaussian has excess kurtosis 0, so at
+12.88 the normal default misprices the tails badly and is a BENCHMARK, not a
+recommendation for live trading. Caveat: ~2 months of one broad volatility regime.
 """
 
 from __future__ import annotations
@@ -66,7 +69,7 @@ MINUTES_PER_YEAR = 365.0 * 24.0 * 60.0
 # Volatility unit conversions
 # --------------------------------------------------------------------------------------
 def annual_to_per_minute(annual_vol: float) -> float:
-    """Convert an annualised vol (e.g. 0.368 for 36.8%) to a per-minute fraction."""
+    """Convert an annualised vol (e.g. 0.436 for the measured 43.6%) to a per-minute fraction."""
     return annual_vol / math.sqrt(MINUTES_PER_YEAR)
 
 

@@ -121,10 +121,18 @@ def _run_entrypoint(module_path: str, names: tuple[str, ...], **kwargs: Any) -> 
             f"it accepts {sorted(params)}. Refusing to run with silently ignored arguments."
         )
 
-    result = fn(**call_kwargs)
-    if inspect.iscoroutine(result):
-        return asyncio.run(result)
-    return result
+    try:
+        result = fn(**call_kwargs)
+        if inspect.iscoroutine(result):
+            return asyncio.run(result)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        # A locked database is an operator situation, not a crash. Render the advice
+        # the store already wrote rather than a DuckDB traceback.
+        if type(exc).__name__ == "StoreLocked":
+            _fail(str(exc))
+            return None
+        raise
 
 
 def _fmt_td(seconds: float) -> str:
@@ -826,6 +834,14 @@ def calibrate(
                 "[yellow]IN-SAMPLE:[/] not enough settlement history to hold out a test "
                 "window, so this is an upper bound, not a backtest."
             )
+        if result.get("spot_source") == "spot-proxy":
+            # Never let a skill score imply we had the real index when we did not.
+            console.print(
+                "[yellow]SPOT PROXY:[/] scored against the free public Coinbase/Kraken/"
+                "Bitstamp composite, not the licensed BRTI tape (no credentials). The "
+                "proxy's tracking error is small next to a $100 strike gap but decisive "
+                "in the settlement minute — grade it with [bold]kbtc proxy-score[/]."
+            )
     console.print("\n[dim]Now run [bold]kbtc report[/bold] to see the reliability diagram.[/]")
 
 
@@ -910,6 +926,11 @@ def paper(
             duration_s=duration,
             hours=hours,
         )
+    except RuntimeError as exc:
+        # Expected operational states (e.g. the capture DB write lock) arrive as
+        # RuntimeError carrying a sentence meant for a human. Not a crash.
+        _fail(str(exc))
+        return
     except KeyboardInterrupt:
         console.print("\n[yellow]Paper session stopped.[/] Run `kbtc report`.")
 

@@ -39,7 +39,7 @@ from kalshi_btc.model.vol import (
 )
 
 SEED = 20260728
-TRUE_SIGMA_MIN = annual_to_per_minute(0.368)  # 0.393%/hour, the measured KXBTCD level
+TRUE_SIGMA_MIN = annual_to_per_minute(0.436)  # 0.466%/hour, the measured KXBTCD level
 SPOT = 63_800.0
 
 
@@ -596,7 +596,7 @@ def test_vol_model_recovers_sigma_from_the_settlement_series():
 
     sigma = model.sigma_per_minute(times[-1] + timedelta(hours=1))
     assert sigma == pytest.approx(TRUE_SIGMA_MIN, rel=0.15)
-    assert per_minute_to_annual(sigma) == pytest.approx(0.368, rel=0.15)
+    assert per_minute_to_annual(sigma) == pytest.approx(0.436, rel=0.15)
 
 
 def test_vol_model_is_not_fooled_by_the_averaging_correction():

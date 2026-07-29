@@ -187,6 +187,10 @@ def _q(value: Decimal | float | int | str | None) -> Decimal | None:
     return dec(value).quantize(_SCALE)
 
 
+class StoreLocked(RuntimeError):
+    """The DuckDB file is held by another process (usually a running capture)."""
+
+
 class Store:
     """Buffered DuckDB writer plus the read helpers calibration and reporting need.
 
@@ -223,7 +227,21 @@ class Store:
         if self._conn is not None:
             return self._conn
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = duckdb.connect(str(self.path))
+        try:
+            self._conn = duckdb.connect(str(self.path))
+        except duckdb.IOException as exc:
+            # DuckDB is single-writer. The overwhelmingly likely cause is a capture that
+            # is already running (or one that was killed without releasing the lock), so
+            # say that in words instead of surfacing a raw engine traceback.
+            raise StoreLocked(
+                f"The database at {self.path} is locked by another process.\n"
+                "  A `kbtc capture` is probably already running - only one writer is "
+                "allowed at a time.\n"
+                "  Check with:  ps aux | grep kalshi_btc\n"
+                "  Stop it with: pkill -f kalshi_btc\n"
+                "  (Read-only commands like `report` and `proxy-score` work fine "
+                "alongside a running capture.)"
+            ) from exc
         for ddl in SCHEMA.values():
             self._conn.execute(ddl)
         log.info("store open at %s", self.path)

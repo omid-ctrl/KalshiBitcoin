@@ -72,8 +72,9 @@ PRICE_BUCKETS: tuple[tuple[str, float, float], ...] = (
 )
 
 # Fallback vol when we have to price captured snapshots ourselves. Measured on the
-# realised KXBTCD settlement series: 0.393%/hour == 36.8% annualised.
-DEFAULT_ANNUAL_VOL = 0.368
+# realised KXBTCD settlement series: 0.466%/hour == 43.6% annualised, over 1,596 hourly
+# settlements spanning 2026-05-22 to 2026-07-29 (~2 months, one broad regime).
+DEFAULT_ANNUAL_VOL = 0.436
 
 _STRIKE_RE = re.compile(r"-T([\d.]+)$")
 
@@ -151,6 +152,10 @@ class FillQuality:
 class CaptureStats:
     book_rows: int = 0
     brti_rows: int = 0
+    # Public Coinbase/Kraken/Bitstamp composite. Reported separately from brti_rows
+    # because on a no-credentials install brti_rows is ALWAYS 0 - real-time BRTI is
+    # licensed - and without this tile a perfectly healthy capture looks idle.
+    spot_rows: int = 0
     settled_events: int = 0
     first_seen: datetime | None = None
     last_seen: datetime | None = None
@@ -482,6 +487,12 @@ def _gather_capture_stats(con: Any, cat: dict[str, list[str]], data: ReportData)
     if brti_tbl and brti_tbl != book_tbl:
         try:
             stats.brti_rows = int(con.execute(f'SELECT count(*) FROM "{brti_tbl}"').fetchone()[0])
+        except Exception:
+            pass
+
+    if "spot" in cat:
+        try:
+            stats.spot_rows = int(con.execute("SELECT count(*) FROM spot").fetchone()[0])
         except Exception:
             pass
 
@@ -1876,7 +1887,16 @@ def _capture_section(d: ReportData) -> str:
     )
     parts.append('<div class="tiles">')
     parts.append(_tile("Book snapshots", f"{c.book_rows:,}"))
-    parts.append(_tile("BRTI ticks", f"{c.brti_rows:,}"))
+    parts.append(
+        _tile(
+            "BRTI ticks",
+            f"{c.brti_rows:,}",
+            "licensed feed — needs an API key" if not c.brti_rows else "the real index",
+        )
+    )
+    parts.append(
+        _tile("Spot proxy rows", f"{c.spot_rows:,}", "public Coinbase/Kraken/Bitstamp")
+    )
     parts.append(_tile("Events seen", f"{c.distinct_events:,}"))
     parts.append(_tile("Settled events", f"{c.settled_events:,}", "with expiration_value"))
     parts.append("</div>")

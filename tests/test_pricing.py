@@ -39,14 +39,14 @@ def simulate_settlements(
 
 
 def test_vol_unit_roundtrip():
-    assert per_minute_to_annual(annual_to_per_minute(0.368)) == pytest.approx(0.368)
+    assert per_minute_to_annual(annual_to_per_minute(0.436)) == pytest.approx(0.436)
 
 
 @pytest.mark.parametrize("minutes", [2.0, 5.0, 20.0, 60.0])
 def test_settlement_std_matches_monte_carlo(minutes):
     """The exact discrete variance formula must match simulation."""
     rng = np.random.default_rng(SEED)
-    spot, sigma = 63_800.0, annual_to_per_minute(0.368)
+    spot, sigma = 63_800.0, annual_to_per_minute(0.436)
     sims = simulate_settlements(spot, sigma, minutes, 60_000, rng)
     assert sims.std(ddof=1) == pytest.approx(
         settlement_std_dollars(sigma, spot, minutes), rel=0.03
@@ -59,7 +59,7 @@ def test_averaging_reduces_variance_versus_point_in_time():
     This is the always-on edge: the average shaves ~40 seconds of variance off every
     quote for the entire hour.
     """
-    spot, sigma, tau = 63_800.0, annual_to_per_minute(0.368), 20.0
+    spot, sigma, tau = 63_800.0, annual_to_per_minute(0.436), 20.0
     asian = settlement_std_dollars(sigma, spot, tau)
     point_in_time = sigma * spot * math.sqrt(tau)
     assert asian < point_in_time
@@ -75,7 +75,7 @@ def test_in_window_uncertainty_collapse(elapsed, expected_ratio):
 
     residual_std = sigma * (m/60)^1.5 / sqrt(3)   vs   naive sigma * sqrt(m/60)
     """
-    spot, sigma = 63_800.0, annual_to_per_minute(0.368)
+    spot, sigma = 63_800.0, annual_to_per_minute(0.436)
     m = TICKS - elapsed
     asian = residual_std_in_window(sigma, spot, elapsed)
     naive = sigma * spot * math.sqrt(m / 60.0)
@@ -85,7 +85,7 @@ def test_in_window_uncertainty_collapse(elapsed, expected_ratio):
 def test_in_window_pricing_matches_monte_carlo():
     """The in-window pricer must reproduce simulated settle-above probabilities."""
     rng = np.random.default_rng(SEED)
-    spot, sigma = 63_800.0, annual_to_per_minute(0.368)
+    spot, sigma = 63_800.0, annual_to_per_minute(0.436)
     known_ticks, n = 30, 80_000
     # Pretend the first 30 ticks all printed at spot.
     known_sum = spot * known_ticks
@@ -123,7 +123,7 @@ def test_late_spike_cannot_rescue_a_locked_in_average():
     strike, spot_low, spiked = 63_800.0, 63_700.0, 63_950.0
     known_ticks = 55
     q = price_above_in_window(
-        strike, spot_low * known_ticks, known_ticks, spiked, annual_to_per_minute(0.368)
+        strike, spot_low * known_ticks, known_ticks, spiked, annual_to_per_minute(0.436)
     )
     assert q.prob_above < 0.02, "late spike must not rescue a locked-in deficit"
 
@@ -138,14 +138,14 @@ def test_early_spike_with_many_ticks_left_does_carry_the_average():
     strike, spot_low, spiked = 63_800.0, 63_700.0, 63_950.0
     known_ticks = 29
     q = price_above_in_window(
-        strike, spot_low * known_ticks, known_ticks, spiked, annual_to_per_minute(0.368)
+        strike, spot_low * known_ticks, known_ticks, spiked, annual_to_per_minute(0.436)
     )
     assert q.prob_above > 0.95
 
 
 def test_fat_tails_raise_far_strike_probabilities():
-    """Student-t must price tails above the Gaussian - measured excess kurtosis is 3.66."""
-    spot, sigma, tau = 63_800.0, annual_to_per_minute(0.368), 30.0
+    """Student-t must price tails above the Gaussian - measured excess kurtosis is 12.88."""
+    spot, sigma, tau = 63_800.0, annual_to_per_minute(0.436), 30.0
     far = spot + 3.0 * settlement_std_dollars(sigma, spot, tau)
     normal = price_above(spot, far, sigma, tau, dist="normal").prob_above
     fat = price_above(spot, far, sigma, tau, dist="t", df=4.0).prob_above
@@ -154,13 +154,13 @@ def test_fat_tails_raise_far_strike_probabilities():
 
 def test_monotonicity_across_the_ladder():
     """P(above K) must strictly decrease in K - the no-arbitrage condition we checked live."""
-    spot, sigma, tau = 63_800.0, annual_to_per_minute(0.368), 25.0
+    spot, sigma, tau = 63_800.0, annual_to_per_minute(0.436), 25.0
     strikes = np.arange(63_000.0, 64_600.0, 100.0)
     probs = [price_above(spot, float(k), sigma, tau).prob_above for k in strikes]
     assert all(a >= b for a, b in zip(probs, probs[1:]))
 
 
 def test_zero_time_to_close_is_degenerate():
-    spot, sigma = 63_800.0, annual_to_per_minute(0.368)
+    spot, sigma = 63_800.0, annual_to_per_minute(0.436)
     assert price_above(spot, 63_700.0, sigma, 0.0).prob_above == 1.0
     assert price_above(spot, 63_900.0, sigma, 0.0).prob_above == 0.0
