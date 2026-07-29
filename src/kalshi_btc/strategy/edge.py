@@ -381,6 +381,43 @@ class FairValueEngine:
     # not a forecast, and quoting off it is how you get picked off by the settlement print.
     min_residual_std_dollars: float = 0.5
 
+    # How wrong our SPOT input is, in dollars, versus the index the contract actually
+    # settles on. This is the single most important number in this file when running off
+    # the public spot proxy rather than the licensed BRTI tape.
+    #
+    # WHY IT MUST GATE TRADING
+    # ------------------------
+    # Fair value is P(settlement > K), so an error in spot propagates to an error in
+    # probability with derivative  dp/dS = density(z) / sigma_settlement.  That 1/sigma is
+    # the whole problem: the Asian-settlement edge exists BECAUSE sigma collapses in the
+    # final minute, and the proxy error is amplified by exactly the same 1/sigma. The edge
+    # and the noise scale identically, so a proxy that is merely "close" is not close
+    # enough precisely where the strategy makes its money.
+    #
+    # Measured with the free Coinbase/Kraken/Bitstamp composite (`kbtc proxy-score`),
+    # the tracking error against the realised BRTI settlement was $9.04. At the money that
+    # is worth ~1.2c of probability error an hour out, but ~16c when the settlement window
+    # opens and ~124c forty-five seconds in - against a taker hurdle of 2.25c. Trading on
+    # that is not trading on edge, it is trading on our own measurement error.
+    #
+    # Set to 0.0 only when spot IS the settlement index (the authenticated
+    # `cfbenchmarks_value` feed). Anything else should carry its measured error.
+    spot_uncertainty_dollars: float = 0.0
+    # Multiple of the propagated probability error to require on top of the fee hurdle.
+    # 1.0 means "the edge must exceed one standard error of our own spot input".
+    spot_uncertainty_k: float = 1.0
+
+    def probability_uncertainty(self, quote: Quote, z: float) -> Decimal:
+        """Probability error implied by our spot uncertainty at this strike.
+
+        dp/dS = density(z) / sigma_settlement, so the probability error is
+        density(z) * spot_error / sigma. Returns 0 when spot is exact.
+        """
+        if self.spot_uncertainty_dollars <= 0 or quote.residual_std <= 0:
+            return Decimal("0")
+        dp = unit_density(z, self.dist, self.df) * self.spot_uncertainty_dollars / quote.residual_std
+        return _to_dollars(min(dp, 1.0))
+
     # ---------------------------------------------------------------- fair value
     def fair_quote(
         self,
@@ -442,8 +479,18 @@ class FairValueEngine:
 
             edge_buy = None if q.yes_ask is None else fair - q.yes_ask
             edge_sell = None if q.yes_bid is None else q.yes_bid - fair
-            hurdle_buy = None if q.yes_ask is None else self.hurdle(q.yes_ask)
-            hurdle_sell = None if q.yes_bid is None else self.hurdle(q.yes_bid)
+
+            # Our own spot input is uncertain, so require the edge to clear that too.
+            # Without this the bot happily "finds" 3-4c of edge in the settlement window
+            # that is entirely proxy tracking error, takes it, and loses.
+            spot_noise = self.probability_uncertainty(mq, z) * Decimal(
+                str(self.spot_uncertainty_k)
+            )
+            if spot_noise > 0:
+                reasons.append(f"spot_noise={float(spot_noise) * 100:.1f}c")
+
+            hurdle_buy = None if q.yes_ask is None else self.hurdle(q.yes_ask) + spot_noise
+            hurdle_sell = None if q.yes_bid is None else self.hurdle(q.yes_bid) + spot_noise
 
             takeable_buy = bool(
                 edge_buy is not None and hurdle_buy is not None and edge_buy >= hurdle_buy

@@ -687,6 +687,49 @@ def _heartbeat(
         console.print(f"[dim]vol: {vol_source} | {ladder.dist} df={ladder.df:.2f}[/]")
 
 
+# Conservative fallback when the proxy has never been scored. It is deliberately the
+# measured value rather than something optimistic: an unscored proxy is not a better
+# proxy, and defaulting to 0 would silently restore the behaviour this exists to stop.
+UNSCORED_PROXY_ERROR_DOLLARS = 9.04
+
+
+def _engine_for_spot_source(settings, store, console) -> FairValueEngine:
+    """Build the pricing engine with an honest estimate of our own spot error.
+
+    Fair value is P(settlement > K), so spot error propagates to probability error with
+    derivative density(z)/sigma_settlement. The 1/sigma term means the error EXPLODES in
+    exactly the settlement window where the strategy expects to make its money - the same
+    variance collapse that creates the edge amplifies the noise identically.
+
+    So the engine must know how wrong its spot input is. When we hold credentials the spot
+    IS the settlement index (`cfbenchmarks_value`) and the error is zero. On the free
+    public proxy it is whatever `kbtc proxy-score` last measured against realised
+    settlements.
+    """
+    if settings.has_credentials:
+        # Spot is the settlement index itself; no tracking error to carry.
+        return FairValueEngine(spot_uncertainty_dollars=0.0)
+
+    err = UNSCORED_PROXY_ERROR_DOLLARS
+    detail = "never scored"
+    try:
+        from kalshi_btc.model.proxy_score import score_proxy
+
+        score = score_proxy(store.conn)
+        if score.n > 0 and score.median_abs_error == score.median_abs_error:  # not NaN
+            err = float(score.median_abs_error)
+            detail = f"measured over {score.n} settled event(s)"
+    except Exception as exc:  # noqa: BLE001 - scoring is advisory, never fatal
+        detail = f"scoring unavailable ({type(exc).__name__})"
+
+    console.print(
+        f"[yellow]spot is the PUBLIC PROXY, not the settlement index[/] - carrying "
+        f"${err:,.2f} of spot uncertainty ({detail}). Edges must clear it as well as the "
+        f"fee, so expect few or no takes near the close."
+    )
+    return FairValueEngine(spot_uncertainty_dollars=err)
+
+
 async def run_paper(
     settings: Settings,
     duration_s: float | None = None,
@@ -726,7 +769,7 @@ async def run_paper(
             "runs. Restart capture when the session ends."
         ) from exc
 
-    engine = engine or FairValueEngine()
+    engine = engine or _engine_for_spot_source(settings, store, console)
     quoter = quoter or MakerQuoter(risk=settings.risk, refresh_seconds=ladder_interval_s)
     killswitch = KillSwitch()
     risk = RiskManager(risk=settings.risk, killswitch=killswitch)
@@ -735,6 +778,9 @@ async def run_paper(
 
     feed: KalshiWebSocket | None = None
     spot_feed: SpotFeed | None = None
+    # Settlements we are still waiting on. Kalshi publishes expiration_value a few
+    # minutes AFTER close, so these outlive the event that created them.
+    deferred_settlements: list[asyncio.Task] = []
     deadline = None if duration_s is None else time.monotonic() + duration_s
 
     console.print(f"[bold]kbtc paper[/] | {settings.describe()}")
@@ -824,7 +870,8 @@ async def run_paper(
                     nxt_current = await discover_hourly_event(client)
                     if nxt_current and nxt_current["event_ticker"] != event_ticker:
                         realised = await _close_out(
-                            client, store, risk, sim, event_ticker, settings.armed
+                            client, store, risk, sim, event_ticker, settings.armed,
+                            deferred=deferred_settlements, console=console,
                         )
                         console.print(
                             f"[bold magenta]rollover[/] {event_ticker} -> "
@@ -845,6 +892,20 @@ async def run_paper(
     except (asyncio.CancelledError, KeyboardInterrupt):
         console.print("[yellow]interrupted - flushing buffers[/]")
     finally:
+        # Wait for any hour that closed but had not settled yet. Cancelling these would
+        # throw away the realised P&L of the final event - the single number a paper
+        # session exists to produce. Bounded so a stuck venue cannot hang the process.
+        if deferred_settlements:
+            pending = [t for t in deferred_settlements if not t.done()]
+            if pending:
+                console.print(
+                    f"[dim]waiting up to 6 min for {len(pending)} settlement(s) to "
+                    f"publish so the last hour is scored...[/]"
+                )
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait(pending, timeout=360)
+            for t in deferred_settlements:
+                t.cancel()
         if feed is not None:
             await feed.stop()
         if spot_feed is not None:
@@ -868,6 +929,84 @@ async def run_paper(
     return counters.as_dict()
 
 
+@dataclass(frozen=True)
+class _PendingSettlement:
+    """A position snapshot kept alive across an event boundary.
+
+    Copied out of RiskManager rather than referenced, because RiskManager drops positions
+    the moment the event rolls and we still need to score them minutes later.
+    """
+
+    ticker: str
+    strike: Decimal
+    contracts: int
+    cash: Decimal
+
+    def realised(self, settlement_value: Decimal) -> Decimal:
+        """Same rule the venue uses: YES pays $1 per contract iff settlement > strike."""
+        if settlement_value > self.strike:
+            return self.cash + Decimal(self.contracts)
+        return self.cash
+
+
+# Kalshi's expected_expiration_time is close + 5 minutes; allow generous slack because a
+# late settlement is still free ground truth and a missed one cannot be recovered.
+SETTLE_LATER_ATTEMPTS = 20
+SETTLE_LATER_INTERVAL_S = 30.0
+
+
+async def _settle_later(
+    client: KalshiClient,
+    store: Store,
+    event_ticker: str,
+    pending: list[_PendingSettlement],
+    console: Console,
+    armed: bool,
+) -> Decimal:
+    """Wait for the venue to publish expiration_value, then score the closed event.
+
+    Without this the paper runner marks every hour out at cost, because rollover happens
+    at close and settlement publishes minutes later. Realised P&L would be $0.00 forever.
+    """
+    if not pending:
+        return Decimal("0")
+
+    for _ in range(SETTLE_LATER_ATTEMPTS):
+        await asyncio.sleep(SETTLE_LATER_INTERVAL_S)
+        try:
+            snap = await client.get_market(pending[0].ticker)
+        except Exception:  # noqa: BLE001 - a transient API error must not lose the event
+            continue
+        if snap.expiration_value is None:
+            continue
+
+        value = snap.expiration_value
+        store.upsert_settlement(
+            close_time=snap.close_time, event_ticker=event_ticker, expiration_value=value
+        )
+        realised = sum((p.realised(value) for p in pending), Decimal("0"))
+        store.add_decision(
+            ts=datetime.now(UTC),
+            ticker=event_ticker,
+            fair_prob=0.0,
+            market_mid=None,
+            edge=float(realised),
+            action="settle_deferred",
+            reason=f"settled at BRTI 60s avg {value} ({len(pending)} position(s))",
+            armed=armed,
+        )
+        console.print(
+            f"[bold]settled[/] {event_ticker} @ {value} -> "
+            f"[{'green' if realised >= 0 else 'red'}]realised ${realised:+.2f}[/] "
+            f"over {len(pending)} position(s)"
+        )
+        return realised
+
+    log.warning("gave up waiting for %s settlement after %d attempts",
+                event_ticker, SETTLE_LATER_ATTEMPTS)
+    return Decimal("0")
+
+
 async def _close_out(
     client: KalshiClient,
     store: Store,
@@ -875,6 +1014,9 @@ async def _close_out(
     sim: FillSimulator,
     event_ticker: str,
     armed: bool,
+    *,
+    deferred: list[asyncio.Task],
+    console: Console,
 ) -> Decimal:
     """Settle the finished event and drop every resting order.
 
@@ -903,8 +1045,24 @@ async def _close_out(
         realised = risk.settle_event(event_ticker, expiration)
         reason = f"settled at BRTI 60s avg {expiration}"
     else:
+        # Kalshi publishes expiration_value 2-5 MINUTES after close, but rollover happens
+        # AT close - so this branch is the normal case, not the exception. Marking out at
+        # cost and walking away would mean realised P&L is $0.00 every single hour, i.e.
+        # the paper runner could never answer the only question it exists to answer.
+        #
+        # So snapshot the positions, hand them to a background task that retries until the
+        # venue publishes, and settle them properly then.
+        pending = [
+            _PendingSettlement(ticker=p.ticker, strike=p.strike, contracts=p.contracts, cash=p.cash)
+            for p in positions
+        ]
         realised = risk.abandon_event(event_ticker)
-        reason = "no expiration_value published yet; marked out at cost"
+        reason = "expiration_value not published yet; queued for deferred settlement"
+        deferred.append(
+            asyncio.create_task(
+                _settle_later(client, store, event_ticker, pending, console, armed)
+            )
+        )
 
     store.add_decision(
         ts=datetime.now(UTC),
