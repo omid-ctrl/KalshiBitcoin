@@ -1,0 +1,28 @@
+# SECRETS — never commit. The Kalshi RSA private key must never reach GitHub.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+keys/
+
+# Data — captured market data is large and regenerable
+data/
+*.duckdb
+*.duckdb.wal
+*.parquet
+reports/out/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# OS / tooling
+.DS_Store
+.playwright-mcp/
