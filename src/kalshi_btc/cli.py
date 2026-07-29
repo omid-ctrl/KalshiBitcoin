@@ -800,6 +800,12 @@ def calibrate(
             settings=s,
             days=days,
         )
+    except typer.Exit:
+        # MUST come first: typer.Exit subclasses RuntimeError and stringifies to "", so
+        # the handler below would swallow a clean exit and re-report it as a blank "✗"
+        # failure — including the exit that `_run_entrypoint` itself raises after it has
+        # already printed a perfectly good message.
+        raise
     except RuntimeError as exc:
         # The runner raises RuntimeError with an operator-readable sentence when there is
         # not enough data yet. That is an expected state, not a crash.
@@ -926,6 +932,9 @@ def paper(
             duration_s=duration,
             hours=hours,
         )
+    except typer.Exit:
+        # See the note in `calibrate`: typer.Exit IS a RuntimeError with an empty message.
+        raise
     except RuntimeError as exc:
         # Expected operational states (e.g. the capture DB write lock) arrive as
         # RuntimeError carrying a sentence meant for a human. Not a crash.

@@ -73,7 +73,7 @@ from kalshi_btc.feed.spot_ws import DEFAULT_VENUES, SpotFeed
 from kalshi_btc.model.vol import VolModel
 from kalshi_btc.risk.killswitch import KillSwitch
 from kalshi_btc.risk.limits import RiskManager
-from kalshi_btc.store.db import Store
+from kalshi_btc.store.db import Store, StoreLocked
 from kalshi_btc.strategy.edge import (
     MEASURED_SIGMA_PER_HOUR,
     FairValueEngine,
@@ -711,26 +711,19 @@ async def run_paper(
     store = store or Store(settings)
     try:
         await store.start()
-    except Exception as exc:  # noqa: BLE001 - translated to an operator sentence below
-        # DuckDB allows exactly ONE writer process, and paper is a writer: it records
-        # ladder snapshots, decisions and simulated fills. `kbtc capture` is also a
-        # writer and the README tells you to leave it running forever, so operators hit
-        # this collision on their first Phase 2 run. A raw IOException traceback does not
-        # tell anyone what to do about it, and the two readers (`report`, `calibrate`)
-        # already degrade gracefully, so this one should explain itself too.
-        if "lock" not in str(exc).lower():
-            raise
-        raise RuntimeError(
-            f"The capture database {store.path} is locked by another process — almost "
-            "certainly `kbtc capture`. DuckDB allows only one writer, and `kbtc paper` "
-            "is a writer too (it records ladder snapshots, decisions and simulated "
-            "fills).\n\n"
-            "Stop `kbtc capture` for the duration of the paper session. Paper records "
-            "the ladder itself, so you keep collecting ladder history while it runs — "
-            "you only lose the public spot-proxy rows, which paper does not write. "
-            "Restart capture when the session ends.\n\n"
-            "`kbtc report` and `kbtc calibrate` are readers and DO work while capture "
-            "holds the lock; only the writers collide."
+    except StoreLocked as exc:
+        # `Store.open` already explains the single-writer rule and how to find the
+        # offending process. Add only what is specific to THIS command - that paper is
+        # itself a writer, and that stopping capture for the session costs you almost
+        # nothing - and re-raise as StoreLocked so the CLI still renders it as an
+        # operator situation rather than a crash.
+        raise StoreLocked(
+            f"{exc}\n\n"
+            "  `kbtc paper` is a WRITER too: it records ladder snapshots, decisions and "
+            "simulated fills, so it cannot share the file with a running capture.\n"
+            "  Stop capture for the duration of the session — paper records the ladder "
+            "AND the public spot proxy itself, so you keep collecting both while it "
+            "runs. Restart capture when the session ends."
         ) from exc
 
     engine = engine or FairValueEngine()
