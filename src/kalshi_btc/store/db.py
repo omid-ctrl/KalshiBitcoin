@@ -93,6 +93,23 @@ SCHEMA: dict[str, str] = {
             tick_count    INTEGER
         )
     """,
+    # Public exchange top-of-book plus the composite BRTI proxy at that instant.
+    #
+    # One row PER VENUE UPDATE, not one row per composite: keeping the venue's own
+    # bid/ask alongside the aggregate is what makes it possible to re-derive the proxy
+    # later under a different aggregation rule, or to prove after the fact that a bad
+    # print came from one venue rather than from our arithmetic. `proxy` is nullable
+    # because the feed refuses to publish a composite when too few venues are fresh.
+    "spot": """
+        CREATE TABLE IF NOT EXISTS spot (
+            ts     TIMESTAMP     NOT NULL,
+            venue  VARCHAR       NOT NULL,
+            bid    DECIMAL(18,6),
+            ask    DECIMAL(18,6),
+            mid    DECIMAL(18,6),
+            proxy  DECIMAL(18,6)
+        )
+    """,
     # event_ticker is the PK because settlement is a property of the EVENT, not of the
     # 188 markets under it - they all carry the identical expiration_value.
     "settlements": """
@@ -138,6 +155,7 @@ _INSERTS: dict[str, str] = {
     "book_deltas": "INSERT INTO book_deltas VALUES (?,?,?,?,?,?)",
     "trades": "INSERT INTO trades VALUES (?,?,?,?,?)",
     "brti": "INSERT INTO brti VALUES (?,?,?,?,?,?)",
+    "spot": "INSERT INTO spot VALUES (?,?,?,?,?,?)",
     "fills": "INSERT INTO fills VALUES (?,?,?,?,?,?,?,?,?)",
     "decisions": "INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?)",
     # Re-running a backfill must be a no-op, not a duplicate row.
@@ -343,6 +361,24 @@ class Store:
             (_utc(ts), index_id, _q(value), _q(avg_60s), _q(windowed_avg), tick_count),
         )
 
+    def add_spot(
+        self,
+        *,
+        ts: datetime,
+        venue: str,
+        bid: Decimal | None,
+        ask: Decimal | None,
+        mid: Decimal | None,
+        proxy: Decimal | None,
+    ) -> None:
+        """One public-exchange top-of-book update plus the composite proxy at that time.
+
+        This is the only price series `kbtc capture` can record without credentials, so
+        it is written unconditionally - see kalshi_btc.feed.spot_ws for why it is a PROXY
+        for BRTI rather than BRTI itself.
+        """
+        self._buffer("spot", (_utc(ts), str(venue), _q(bid), _q(ask), _q(mid), _q(proxy)))
+
     def add_fill(
         self,
         *,
@@ -432,6 +468,26 @@ class Store:
         return self.conn.execute(
             "SELECT * FROM fills WHERE ts >= ? ORDER BY ts", [_utc(since)]
         ).df()
+
+    def spot_history(
+        self, start: datetime | None = None, end: datetime | None = None
+    ) -> pd.DataFrame:
+        """Public spot ticks in [start, end], oldest first. Both bounds are optional.
+
+        Bounds are inclusive because the settlement window is defined inclusively at both
+        ends (close-59s through close), and an off-by-one second there is an off-by-one
+        tick in a sixty-tick average.
+        """
+        where: list[str] = []
+        params: list[datetime] = []
+        if start is not None:
+            where.append("ts >= ?")
+            params.append(_utc(start))
+        if end is not None:
+            where.append("ts <= ?")
+            params.append(_utc(end))
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+        return self.conn.execute(f"SELECT * FROM spot{clause} ORDER BY ts", params).df()
 
     def brti_window(self, event_ticker: str, lookback_minutes: float = 60.0) -> pd.DataFrame:
         """BRTI ticks over the hour leading into that event's close.

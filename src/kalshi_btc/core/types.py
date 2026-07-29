@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 
 # KXBTCD-26JUL2819-T63999.99  ->  series, YYMMMDD, hour, strike
@@ -41,6 +41,27 @@ def dec(value: str | float | int | Decimal | None, default: str = "0") -> Decima
     if value is None or value == "":
         return Decimal(default)
     return Decimal(str(value))
+
+
+def dec_or_none(value: str | float | int | Decimal | None) -> Decimal | None:
+    """Parse a field that is *supposed* to be numeric, returning None when it is not.
+
+    Kalshi overloads `expiration_value`: on a settled scalar market it is the realised
+    BRTI average, but on some finalized rows the very same field carries a settlement
+    *outcome* string instead. Measured live on 2026-07-29 across 62 open KXBTCD events,
+    9 markets carried `expiration_value` of "a", "Yes" or "No". `dec()` raises
+    InvalidOperation on those, which previously took down every caller that parsed a
+    ladder - including event discovery, i.e. the whole capture loop.
+
+    A non-numeric value here means "this market has no index level to report", so the
+    honest representation is None rather than a crash or a fabricated zero.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except InvalidOperation:
+        return None
 
 
 @dataclass(frozen=True)
@@ -163,9 +184,9 @@ class MarketSnapshot:
             open_time=_ts(m.get("open_time")),
             close_time=_ts(m.get("close_time")),
             status=m.get("status", ""),
-            expiration_value=(
-                dec(m["expiration_value"]) if m.get("expiration_value") else None
-            ),
+            # Tolerant on purpose: the venue serves "a"/"Yes"/"No" here on some finalized
+            # rows, and one poisoned market must not take down a 188-strike ladder parse.
+            expiration_value=dec_or_none(m.get("expiration_value")),
         )
 
     @property

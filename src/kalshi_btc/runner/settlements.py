@@ -120,6 +120,12 @@ async def backfill_settlements(
             while len(seen) < max_events:
                 params: dict[str, Any] = {
                     "series_ticker": SERIES_TICKER,
+                    # Valid filter values are open/closed/settled/unopened. A freshly
+                    # closed event spends a couple of minutes as status="determined"
+                    # before it turns up here as "finalized"; that is why the rollover
+                    # backfill in capture.py retries rather than assuming one pass is
+                    # enough. Measured: an event closing at 01:00Z appeared under this
+                    # filter at ~01:04Z with expiration_value=63880.45.
                     "status": "settled",
                     "limit": limit,
                 }

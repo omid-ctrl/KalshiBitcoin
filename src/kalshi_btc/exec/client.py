@@ -40,6 +40,9 @@ from kalshi_btc.core.types import Book, BookLevel, MarketSnapshot, _ts, dec
 
 log = logging.getLogger(__name__)
 
+RATE_LIMIT_RETRIES = 8
+RATE_LIMIT_MAX_BACKOFF_S = 20.0
+
 DEFAULT_COST = 10
 COST_CANCEL = 2
 COST_CFBENCHMARKS = 50
@@ -174,17 +177,44 @@ class KalshiClient:
 
         url = f"{self.base}{endpoint}"
         last_exc: Exception | None = None
-        for attempt in range(retries):
+        # Rate limiting is a wait, not a failure, so it gets its own generous budget.
+        # The token buckets here are sized for the authenticated Basic tier; the
+        # UNAUTHENTICATED limit is materially tighter, so a public-data recorder will
+        # meet 429s routinely. Counting those against the transport-error budget kills
+        # a 24/7 capture within seconds of a burst - which is exactly what it did.
+        rate_limit_budget = max(retries, RATE_LIMIT_RETRIES)
+        rate_limited = 0
+        attempt = 0
+        while attempt < retries:
             await bucket.take(cost)
             try:
                 async with self.session.request(
                     method, url, params=params, json=json_body, headers=headers
                 ) as resp:
                     if resp.status == 429:
-                        wait = min(2**attempt, 8)
-                        log.warning("rate limited on %s, backing off %ss", endpoint, wait)
+                        rate_limited += 1
+                        if rate_limited > rate_limit_budget:
+                            raise RateLimitError(
+                                f"{method} {endpoint} rate limited {rate_limited} times in a "
+                                f"row. Slow the polling cadence, or add API credentials - the "
+                                f"unauthenticated read limit is much tighter than the "
+                                f"authenticated one."
+                            )
+                        # Honour Retry-After when the venue tells us; otherwise back off
+                        # exponentially on the RATE-LIMIT counter, capped so a recorder
+                        # recovers rather than stalling for minutes.
+                        retry_after = resp.headers.get("Retry-After")
+                        wait = (
+                            float(retry_after)
+                            if retry_after and retry_after.replace(".", "", 1).isdigit()
+                            else min(2**rate_limited, RATE_LIMIT_MAX_BACKOFF_S)
+                        )
+                        last_exc = RateLimitError(f"429 on {endpoint}")
+                        log.warning(
+                            "rate limited on %s (%d), waiting %.1fs", endpoint, rate_limited, wait
+                        )
                         await asyncio.sleep(wait)
-                        continue
+                        continue  # deliberately does NOT consume a transport attempt
                     text = await resp.text()
                     if resp.status >= 400:
                         # Do not retry client errors other than 429 - they will not fix themselves.
@@ -194,6 +224,7 @@ class KalshiClient:
                     return await resp.json() if text else {}
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 last_exc = e
+                attempt += 1
                 # Only idempotent verbs may be retried; a retried POST could double-order.
                 if write and method.upper() == "POST":
                     raise
@@ -349,14 +380,41 @@ def parse_orderbook(ticker: str, payload: dict) -> Book:
 
 HOURLY_SECONDS = 3600
 HOURLY_TOLERANCE_S = 120
+HOURLY_STRIKE_SPACING = Decimal("100")
+MIN_HOURLY_STRIKES = 3
+
+
+def strike_spacing(event: dict) -> Decimal | None:
+    """Smallest gap between adjacent strikes, or None if the ladder is too thin to tell."""
+    strikes = sorted(
+        {dec(m.get("floor_strike")) for m in (event.get("markets") or []) if m.get("floor_strike")}
+    )
+    if len(strikes) < 2:
+        return None
+    return min(b - a for a, b in zip(strikes, strikes[1:]))
 
 
 def event_is_hourly(event: dict) -> bool:
     """True iff this KXBTCD event is the 60-minute cadence.
 
-    Determined from close_time - open_time on the event's markets, because the series
-    ticker alone cannot distinguish hourly from daily/weekly. Falls back to strike
-    spacing (hourly is $100; daily $250; weekly $500) when timestamps are unavailable.
+    The series ticker cannot distinguish the cadences: KXBTCD hosts hourly, DAILY ($250
+    spacing) and WEEKLY ($500) events all at once. So we need a discriminator.
+
+    STRIKE SPACING IS THAT DISCRIMINATOR, and open_time is not. The obvious test -
+    close_time - open_time == 60 minutes - is the correct *definition* but it does not
+    survive contact with the live venue: Kalshi now builds the full ladder days to years
+    ahead of the close, so an hourly event's open->close span is nothing like an hour.
+    Measured on 62 open KXBTCD events on 2026-07-29, that span ranged up to 61,350 hours
+    and matched 0 of 62 events, i.e. the span test concluded there were no hourly markets
+    at all and silently blinded both `kbtc capture` and `kbtc paper`.
+
+    Spacing separates the three cadences cleanly on that same live sample: 60 events at
+    $100 (hourly), 1 at $250 (daily), 1 at $500 (weekly). We still accept a genuine
+    60-minute span when the payload happens to carry one, because that is the real
+    definition and it costs nothing to honour it.
+
+    `MIN_HOURLY_STRIKES` guards against inferring a cadence from a two-strike stub, where
+    a single $100 gap proves nothing about the ladder as a whole.
     """
     markets = event.get("markets") or []
     if not markets:
@@ -366,13 +424,10 @@ def event_is_hourly(event: dict) -> bool:
     open_raw, close_raw = m.get("open_time"), m.get("close_time")
     if open_raw and close_raw:
         span = (_ts(close_raw) - _ts(open_raw)).total_seconds()
-        return abs(span - HOURLY_SECONDS) <= HOURLY_TOLERANCE_S
+        if abs(span - HOURLY_SECONDS) <= HOURLY_TOLERANCE_S:
+            return True
 
-    strikes = sorted({dec(x.get("floor_strike")) for x in markets if x.get("floor_strike")})
-    if len(strikes) < 2:
-        return False
-    spacing = min(b - a for a, b in zip(strikes, strikes[1:]))
-    return spacing == Decimal("100")
+    return strike_spacing(event) == HOURLY_STRIKE_SPACING and len(markets) >= MIN_HOURLY_STRIKES
 
 
 def market_is_kxbtcd(ticker: str) -> bool:

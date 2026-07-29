@@ -90,8 +90,8 @@ def _run_entrypoint(module_path: str, names: tuple[str, ...], **kwargs: Any) -> 
         _fail(
             f"`{module_path}` is not available yet ({exc}).",
             "This command depends on a module that has not been built. "
-            "`kbtc doctor`, `kbtc status`, `kbtc capture` and `kbtc report` are the "
-            "commands that work earliest.",
+            "`kbtc doctor`, `kbtc status`, `kbtc capture`, `kbtc settlements`, "
+            "`kbtc calibrate` and `kbtc report` all work today.",
         )
         return None
 
@@ -368,6 +368,9 @@ def _print_next_steps(s: Any, rows: list[tuple[str, str, str, str]]) -> None:
     if levels.get("REST reachable") == PASS:
         steps.append("[bold]kbtc capture[/]   start recording now — history cannot be backfilled")
         steps.append("[bold]kbtc status[/]    see the live strike ladder")
+        steps.append(
+            "[bold]kbtc proxy-score[/] grade the free spot proxy against real settlements"
+        )
     if not s.has_credentials:
         steps.append("[dim]Add an API key when you want balances, fills or orders (README).[/]")
     steps.append("[bold]kbtc report[/]    build the HTML report (works with zero trades)")
@@ -641,6 +644,132 @@ def settlements(
 
 
 # ======================================================================================
+# proxy-score
+# ======================================================================================
+@app.command("proxy-score")
+def proxy_score(
+    threshold: Annotated[
+        float,
+        typer.Option("--threshold", help="Median |error| in dollars below which this PASSes."),
+    ] = 5.0,
+    min_ticks: Annotated[
+        int,
+        typer.Option("--min-ticks", help="Require this many of the 60 settlement seconds."),
+    ] = 30,
+    events: Annotated[
+        int, typer.Option("--events", help="How many per-event rows to list (0 = none).")
+    ] = 10,
+) -> None:
+    """PHASE 1 GATE: does our public spot proxy track the real BRTI settlement?
+
+    We do not have a real-time BRTI feed — it is licensed, and Kalshi only proxies it to
+    accounts with credentials. `kbtc capture` therefore builds a proxy from public
+    Coinbase/Kraken/Bitstamp order books. This command grades that proxy against the
+    truth: every settled event publishes `expiration_value`, the realised BRTI 60-second
+    average, so we compute OUR 60-second average over the identical window and measure
+    the error.
+
+    Needs no credentials. Run `kbtc capture` across at least one hourly close and
+    `kbtc settlements` first, or there is nothing to compare.
+
+    Exits 1 on FAIL so it can gate a pipeline. NO DATA exits 0 — unknown is not failure.
+    """
+    from kalshi_btc.model.proxy_score import explain, score_proxy
+    from kalshi_btc.store.db import ReaderUnavailable, open_reader
+
+    s = _settings()
+    try:
+        conn, source = open_reader(s)
+    except ReaderUnavailable as exc:
+        _fail(str(exc), "Start `kbtc capture` and let it run through a full hour.")
+        return
+
+    try:
+        score = score_proxy(conn, threshold_dollars=threshold, min_ticks=min_ticks)
+    except Exception as exc:  # noqa: BLE001
+        _fail(f"could not score the proxy: {type(exc).__name__}: {exc}")
+        return
+    finally:
+        conn.close()
+
+    console.print()
+    console.print(
+        Panel.fit(
+            "[bold]Spot proxy vs realised BRTI settlement[/]\n"
+            "[dim]expiration_value is the exchange's own 60x1s BRTI average — free, public "
+            "ground truth.[/]",
+            border_style="cyan",
+        )
+    )
+
+    table = Table(box=None, header_style="bold", padding=(0, 2, 0, 0))
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_column("", style="dim")
+
+    def row(name: str, value: str, note: str = "") -> None:
+        table.add_row(name, value, note)
+
+    row("events scored", f"{score.n:,}", f"of {score.events_settled:,} settled on file")
+    if score.events_thin:
+        row("events excluded", f"{score.events_thin:,}", f"fewer than {min_ticks}/60 seconds covered")
+    if score.n:
+        row("median |error|", f"${score.median_abs_error:,.2f}", "the headline number")
+        row("mean error (bias)", f"${score.mean_error:+,.2f}", "signed: + means proxy runs high")
+        row("p90 |error|", f"${score.p90_abs_error:,.2f}", "")
+        row("p95 |error|", f"${score.p95_abs_error:,.2f}", "this is what sizes the risk")
+        row("max |error|", f"${score.max_abs_error:,.2f}", "")
+        row(
+            "median |error| / strike",
+            f"{score.median_error_frac_spacing:.2%}",
+            f"strikes are ${score.strike_spacing:,.0f} apart",
+        )
+        row("p95 |error| / strike", f"{score.p95_error_frac_spacing:.2%}", "")
+        row("median ticks used", f"{score.median_ticks:.0f} / 60", "settlement-window coverage")
+    console.print()
+    console.print(table)
+
+    if score.n and events > 0:
+        per = score.per_event.reindex(
+            score.per_event["abs_error"].abs().sort_values(ascending=False).index
+        ).head(events)
+        detail = Table(
+            title=f"worst {len(per)} event(s)", box=None, header_style="bold", padding=(0, 2, 0, 0)
+        )
+        detail.add_column("close (UTC)")
+        detail.add_column("event")
+        detail.add_column("settled", justify="right")
+        detail.add_column("proxy", justify="right")
+        detail.add_column("error", justify="right")
+        detail.add_column("ticks", justify="right")
+        for r in per.itertuples():
+            err = float(r.error)
+            detail.add_row(
+                r.close_time.strftime("%Y-%m-%d %H:%M"),
+                str(r.event_ticker)[-11:],
+                f"${float(r.expiration_value):,.2f}",
+                f"${float(r.proxy_avg):,.2f}",
+                f"[{'red' if abs(err) >= threshold else 'green'}]{err:+,.2f}[/]",
+                f"{int(r.n_ticks)}",
+            )
+        console.print()
+        console.print(detail)
+
+    verdict = score.verdict
+    style = {"PASS": "bold green", "FAIL": "bold red", "NO DATA": "bold yellow"}[verdict]
+    console.print()
+    console.print(
+        Panel(
+            f"[{style}]{verdict}[/]  ·  threshold: median |error| < ${threshold:,.2f}\n\n"
+            + explain(score),
+            border_style=style.split()[-1],
+        )
+    )
+    console.print(f"[dim]read from {source}[/]")
+    raise typer.Exit(code=1 if verdict == "FAIL" else 0)
+
+
+# ======================================================================================
 # calibrate
 # ======================================================================================
 @app.command()
@@ -754,6 +883,10 @@ def paper(
     hours: Annotated[
         int | None, typer.Option("--hours", help="Stop after N hourly events.")
     ] = None,
+    duration: Annotated[
+        int | None,
+        typer.Option("--duration", help="Stop after N seconds. Handy for a smoke test."),
+    ] = None,
 ) -> None:
     """Paper trade against live markets. No orders are sent, ever.
 
@@ -774,6 +907,7 @@ def paper(
             "kalshi_btc.runner.paper",
             ("run_paper", "main", "run"),
             settings=s,
+            duration_s=duration,
             hours=hours,
         )
     except KeyboardInterrupt:
