@@ -1,0 +1,47 @@
+# systemd unit for 24/7 data capture on a Linux VPS.
+#
+# Runs `kbtc capture` only. Capture has no order path, so this is safe to leave running
+# permanently regardless of the ARMED flag.
+#
+#   sudo cp deploy/kbtc-capture.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now kbtc-capture
+#   journalctl -u kbtc-capture -f
+#
+# Adjust User and the two paths to match wherever the repo actually lives.
+
+[Unit]
+Description=kbtc — Kalshi KXBTCD hourly BTC market data capture
+Documentation=https://github.com/omid-ctrl/KalshiBitcoin
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kbtc
+WorkingDirectory=/opt/kalshibtc
+Environment=PYTHONPATH=/opt/kalshibtc/src
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/kalshibtc/.venv/bin/python -m kalshi_btc.cli --env prod capture
+
+# An hour not recorded cannot be bought back, so always come back up. The delay stops a
+# crash loop from hammering the venue and earning a rate limit.
+Restart=always
+RestartSec=30
+
+# Give the buffered writer time to flush its tail on shutdown rather than losing it.
+KillSignal=SIGINT
+TimeoutStopSec=60
+
+# Hardening. The process needs the network, its own directory, and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/kalshibtc/data
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent for 24/7 data capture on macOS.
+
+  This runs `kbtc capture` ONLY. Capture records market data and never places an order,
+  so this is safe to leave running permanently regardless of the ARMED flag.
+
+  Kalshi sells no historical order book data and offers no backfill endpoint, so an hour
+  this is not running is research data that is gone for good. That is the entire reason
+  this file exists.
+
+  Install (edit the paths first if the repo lives elsewhere):
+      cp deploy/com.kalshibtc.capture.plist ~/Library/LaunchAgents/
+      launchctl load  ~/Library/LaunchAgents/com.kalshibtc.capture.plist
+      launchctl list | grep kalshibtc
+
+  Stop / uninstall:
+      launchctl unload ~/Library/LaunchAgents/com.kalshibtc.capture.plist
+
+  Logs:
+      tail -f ~/Desktop/Projects/KalshiBitcoin/data/capture.log
+
+  NOTE: capture holds the DuckDB write lock. `kbtc paper` is also a writer, so unload
+  this agent before a paper session (`kbtc report` and `kbtc proxy-score` read fine
+  alongside it).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.kalshibtc.capture</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/omidebrahimi/Desktop/Projects/KalshiBitcoin/.venv/bin/python</string>
+        <string>-m</string>
+        <string>kalshi_btc.cli</string>
+        <string>--env</string>
+        <string>prod</string>
+        <string>capture</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/omidebrahimi/Desktop/Projects/KalshiBitcoin</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/omidebrahimi/Desktop/Projects/KalshiBitcoin/src</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+
+    <!-- Start at login and restart if it ever exits. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <!-- Do not hammer the venue if it is crash-looping. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/omidebrahimi/Desktop/Projects/KalshiBitcoin/data/capture.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/omidebrahimi/Desktop/Projects/KalshiBitcoin/data/capture.log</string>
+</dict>
+</plist>
